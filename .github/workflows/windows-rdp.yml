@@ -2,55 +2,468 @@ name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      keep_alive_hours:
+        description: "保活时长（小时，最大 5.5）"
+        required: false
+        default: "5"
+
+env:
+  RDP_USER: NvdAdmin
+  RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 330
 
     steps:
+      - name: 0. Validate Secrets
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            Write-Host "::error::TAILSCALE_AUTHKEY secret 未配置！请到 Settings > Secrets 添加。"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            Write-Host "::error::RDP_PASSWORD secret 未配置！请到 Settings > Secrets 添加。"
+            exit 1
+          }
+          Write-Host "✅ Secrets 校验通过"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
       - name: 1. Enable Remote Desktop & Firewall
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          Write-Host "✅ 远程桌面已开启"
 
       - name: 2. Create Admin Account
         run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvdAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvdAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin P@ssw0rd1qazXSW@#
+          $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          net user runneradmin $env:RDP_PASSWORD
+          Write-Host "✅ 管理员账户 $env:RDP_USER 已创建"
+        env:
+          RDP_USER: ${{ env.RDP_USER }}
+          RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
 
       - name: 3. Install & Connect Tailscale VPN
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Download and install Tailscale silently
+          # Download Tailscale
+          Write-Host "⬇️  下载 Tailscale..."
+          $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+
+          # Install silently
+          Write-Host "📦 安装 Tailscale..."
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
 
-          # Connect to Tailscale network
+          # Connect to Tailscale
+          Write-Host "🔗 连接 Tailscale 网络..."
           Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp" 2>&1
 
-          Start-Sleep -Seconds 8
+          Start-Sleep -Seconds 10
 
           # Get Tailscale IP
           $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          if ([string]::IsNullOrWhiteSpace($ts_ip)) {
+            Write-Host "::error::Tailscale IP 获取失败，请检查 AUTHKEY 是否有效"
+            exit 1
+          }
+
+          # Calculate end time
+          $hours = [double]"${{ github.event.inputs.keep_alive_hours }}"
+          $endTime = (Get-Date).AddHours($hours)
 
           Write-Host ""
           Write-Host "==========================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
+          Write-Host "  Username     : $env:RDP_USER" -ForegroundColor Yellow
+          Write-Host "  Password     : (see RDP_PASSWORD secret)" -ForegroundColor Yellow
+          Write-Host "  End Time     : $endTime (UTC)" -ForegroundColor Yellow
           Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==========================================" -ForegroundColor Green
 
-      - name: 4. Keep Server Alive (48 Hours)
+      - name: 4. Install Software - Browsers & Tools
         run: |
-          for ($i = 1; $i -le 2880; $i++) {
-              Start-Sleep -Seconds 60
-              Write-Host "[$i/2880] Server running..."
+          $ProgressPreference = 'SilentlyContinue'
+
+          # Google Chrome
+          Write-Host "🌐 安装 Chrome..."
+          Invoke-WebRequest "https://dl.google.com/chrome/install/latest/chrome_installer.exe" -OutFile "C:\chrome.exe"
+          Start-Process "C:\chrome.exe" -ArgumentList "/silent /install" -Wait -ErrorAction SilentlyContinue
+
+          # Firefox
+          Write-Host "🦊 安装 Firefox..."
+          Invoke-WebRequest "https://download.mozilla.org/?product=firefox-latest-ssl&os=win64&lang=zh-CN" -OutFile "C:\firefox.exe"
+          Start-Process "C:\firefox.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # 7-Zip
+          Write-Host "📦 安装 7-Zip..."
+          Invoke-WebRequest "https://www.7-zip.org/a/7z2409-x64.exe" -OutFile "C:\7z.exe"
+          Start-Process "C:\7z.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # Notepad++
+          Write-Host "📝 安装 Notepad++..."
+          Invoke-WebRequest "https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.6.9/npp.8.6.9.Installer.x64.exe" -OutFile "C:\npp.exe"
+          Start-Process "C:\npp.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # Everything (文件搜索)
+          Write-Host "🔍 安装 Everything..."
+          Invoke-WebRequest "https://www.voidtools.com/Everything-1.4.1.1024.x64-Setup.exe" -OutFile "C:\everything.exe"
+          Start-Process "C:\everything.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          Write-Host "✅ 浏览器 & 工具安装完成"
+
+      - name: 5. Install Software - Dev & CLI
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          # winget 安装基础开发工具
+          Write-Host "⚡ 通过 winget 安装开发工具..."
+          $apps = @(
+            "Git.Git",
+            "Microsoft.VisualStudioCode",
+            "Python.Python.3.12",
+            "OpenJS.NodeJS.LTS",
+            "Microsoft.PowerToys",
+            "Rufus.Rufus",
+            "7zip.7zip"
+          )
+          foreach ($app in $apps) {
+            Write-Host "  → $app"
+            winget install $app --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
           }
+
+          # PowerShell 7
+          Write-Host "💎 安装 PowerShell 7..."
+          Invoke-WebRequest "https://github.com/PowerShell/PowerShell/releases/latest/download/PowerShell-7.4.6-win-x64.msi" -OutFile "C:\pwsh7.msi"
+          Start-Process msiexec -ArgumentList "/i C:\pwsh7.msi /quiet /norestart" -Wait -ErrorAction SilentlyContinue
+
+          Write-Host "✅ 开发工具安装完成"
+
+      - name: 6. Install Software - Media & Social
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          # VLC
+          Write-Host "🎬 安装 VLC..."
+          Invoke-WebRequest "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.exe" -OutFile "C:\vlc.exe"
+          Start-Process "C:\vlc.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # qBittorrent
+          Write-Host "📥 安装 qBittorrent..."
+          Invoke-WebRequest "https://sourceforge.net/projects/qbittorrent/files/qbittorrent-win32/qbittorrent-5.0.2/qbittorrent_5.0.2_x64_setup.exe/download" -OutFile "C:\qbittorrent.exe"
+          Start-Process "C:\qbittorrent.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # Telegram
+          Write-Host "✈️ 安装 Telegram..."
+          Invoke-WebRequest "https://telegram.org/dl/desktop/win64" -OutFile "C:\telegram.exe"
+          Start-Process "C:\telegram.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # PotPlayer
+          Write-Host "🎥 安装 PotPlayer..."
+          Invoke-WebRequest "https://potplayer.tv/download/PotPlayerSetup64.exe" -OutFile "C:\potplayer.exe"
+          Start-Process "C:\potplayer.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          Write-Host "✅ 媒体 & 社交软件安装完成"
+
+      - name: 7. Install Software - Download & Remote
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          # Internet Download Manager (IDM)
+          Write-Host "⬇️ 安装 IDM..."
+          Invoke-WebRequest "https://download3.internetdownloadmanager.com/idman642build28.exe" -OutFile "C:\idm.exe"
+          Start-Process "C:\idm.exe" -ArgumentList "/silent /norestart" -Wait -ErrorAction SilentlyContinue
+
+          # WinSCP (SFTP 客户端)
+          Write-Host "📁 安装 WinSCP..."
+          Invoke-WebRequest "https://winscp.net/download/WinSCP-6.3.6-Setup.exe" -OutFile "C:\winscp.exe"
+          Start-Process "C:\winscp.exe" -ArgumentList "/SILENT" -Wait -ErrorAction SilentlyContinue
+
+          # AnyDesk (远程控制备选)
+          Write-Host "🖥️ 安装 AnyDesk..."
+          Invoke-WebRequest "https://download.anydesk.com/AnyDesk.exe" -OutFile "C:\anydesk.exe"
+          Start-Process "C:\anydesk.exe" -ArgumentList "--silent" -Wait -ErrorAction SilentlyContinue
+
+          # Tailscale 客户端（桌面版，方便管理）
+          Write-Host "🔗 安装 Tailscale GUI..."
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale_gui.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale_gui.msi /quiet /norestart" -Wait -ErrorAction SilentlyContinue
+
+          Write-Host "✅ 下载 & 远程工具安装完成"
+
+      - name: 8. System Tweaks & Desktop Shortcuts
+        run: |
+          # 创建桌面快捷方式
+          $desktop = "C:\Users\Public\Desktop"
+          $shell = New-Object -ComObject WScript.Shell
+
+          $shortcuts = @(
+            @{ Name = "Chrome.lnk";         Target = "C:\Program Files\Google\Chrome\Application\chrome.exe" },
+            @{ Name = "Firefox.lnk";        Target = "C:\Program Files\Mozilla Firefox\firefox.exe" },
+            @{ Name = "VS Code.lnk";        Target = "C:\Program Files\Microsoft VS Code\Code.exe" },
+            @{ Name = "Notepad++.lnk";     Target = "C:\Program Files\Notepad++\notepad++.exe" },
+            @{ Name = "7-Zip.lnk";          Target = "C:\Program Files\7-Zip\7zFM.exe" },
+            @{ Name = "Everything.lnk";     Target = "C:\Program Files\Everything\Everything.exe" },
+            @{ Name = "VLC.lnk";            Target = "C:\Program Files\VideoLAN\VLC\vlc.exe" },
+            @{ Name = "qBittorrent.lnk";    Target = "C:\Program Files\qBittorrent\qbittorrent.exe" },
+            @{ Name = "Telegram.lnk";       Target = "C:\Users\$env:RDP_USER\AppData\Local\Telegram Desktop\Telegram.exe" },
+            @{ Name = "WinSCP.lnk";         Target = "C:\Program Files\WinSCP\WinSCP.exe" },
+            @{ Name = "PowerShell 7.lnk";   Target = "C:\Program Files\PowerShell\7\pwsh.exe" },
+            @{ Name = "PowerToys.lnk";      Target = "C:\Program Files\PowerToys\PowerToys.exe" }
+          )
+
+          foreach ($s in $shortcuts) {
+            if (Test-Path $s.Target) {
+              $lnk = $shell.CreateShortcut("$desktop\$($s.Name)")
+              $lnk.TargetPath = $s.Target
+              $lnk.Save()
+              Write-Host "  ✅ $($s.Name)"
+            } else {
+              Write-Host "  ⚠️ 跳过 $($s.Name)（未安装）"
+            }
+          }
+
+          # 系统优化
+          Write-Host "⚙️ 系统优化..."
+          # 关闭屏幕保护
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "ScreenSaveActive" -Value 0
+          # 关闭休眠
+          powercfg /hibernate off
+          # 设置高性能电源计划
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c6b3c
+          # 显示文件扩展名
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "HideFileExt" -Value 0
+
+          Write-Host "✅ 系统优化完成"
+
+      - name: 9. Install Software - Office & Productivity
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          # LibreOffice（免费 Office 替代）
+          Write-Host "📄 安装 LibreOffice..."
+          Invoke-WebRequest "https://download.documentfoundation.org/libreoffice/stable/25.2.5/win/x86_64/LibreOffice_25.2.5_Win_x86-64.msi" -OutFile "C:\libreoffice.msi"
+          Start-Process msiexec -ArgumentList "/i C:\libreoffice.msi /quiet /norestart" -Wait -ErrorAction SilentlyContinue
+
+          # SumatraPDF（轻量 PDF 阅读器）
+          Write-Host "📕 安装 SumatraPDF..."
+          Invoke-WebRequest "https://www.sumatrapdfreader.org/dl/SumatraPDF-3.5.2-64.exe" -OutFile "C:\sumatra.exe"
+          Start-Process "C:\sumatra.exe" -ArgumentList "/silent" -Wait -ErrorAction SilentlyContinue
+
+          # OBS Studio（录屏/直播）
+          Write-Host "🎥 安装 OBS Studio..."
+          Invoke-WebRequest "https://github.com/obsproject/obs-studio/releases/download/30.2.6/OBS-Studio-30.2.6-Windows-Installer.exe" -OutFile "C:\obs.exe"
+          Start-Process "C:\obs.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # ShareX（截图/录屏）
+          Write-Host "📷 安装 ShareX..."
+          Invoke-WebRequest "https://getsharex.com/downloads/ShareX-16.0.4-setup.exe" -OutFile "C:\sharex.exe"
+          Start-Process "C:\sharex.exe" -ArgumentList "/silent" -Wait -ErrorAction SilentlyContinue
+
+          # Flow Launcher（快速启动器）
+          Write-Host "🚀 安装 Flow Launcher..."
+          Invoke-WebRequest "https://github.com/Flow-Launcher/Flow.Launcher/releases/download/v1.20.0/Flow-Launcher-Setup.exe" -OutFile "C:\flow.exe"
+          Start-Process "C:\flow.exe" -ArgumentList "/silent" -Wait -ErrorAction SilentlyContinue
+
+          Write-Host "✅ 办公 & 生产力软件安装完成"
+
+      - name: 10. Install Software - Network & Security
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          # Nmap（网络扫描）
+          Write-Host "🌐 安装 Nmap..."
+          Invoke-WebRequest "https://nmap.org/dist/nmap-7.95-setup.exe" -OutFile "C:\nmap.exe"
+          Start-Process "C:\nmap.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # Wireshark（抓包）
+          Write-Host "🦈 安装 Wireshark..."
+          Invoke-WebRequest "https://2.na.dl.wireshark.org/win64/Wireshark-4.4.2.exe" -OutFile "C:\wireshark.exe"
+          Start-Process "C:\wireshark.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # OpenVPN
+          Write-Host "🔒 安装 OpenVPN..."
+          Invoke-WebRequest "https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.12-I001-amd64.msi" -OutFile "C:\openvpn.msi"
+          Start-Process msiexec -ArgumentList "/i C:\openvpn.msi /quiet /norestart" -Wait -ErrorAction SilentlyContinue
+
+          # ProtonVPN
+          Write-Host "🛡️ 安装 ProtonVPN..."
+          Invoke-WebRequest "https://protonvpn.com/download/ProtonVPN_v3.exe" -OutFile "C:\protonvpn.exe"
+          Start-Process "C:\protonvpn.exe" -ArgumentList "/silent" -Wait -ErrorAction SilentlyContinue
+
+          # Clash Verge Rev（代理客户端）
+          Write-Host "⚡ 安装 Clash Verge Rev..."
+          Invoke-WebRequest "https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.0.2/Clash.Verge_2.0.2_x64_en-US.msi" -OutFile "C:\clash.msi"
+          Start-Process msiexec -ArgumentList "/i C:\clash.msi /quiet /norestart" -Wait -ErrorAction SilentlyContinue
+
+          # FileZilla（FTP 客户端）
+          Write-Host "📁 安装 FileZilla..."
+          Invoke-WebRequest "https://download.filezilla-project.org/client/FileZilla_3.65.1_win64-setup.exe" -OutFile "C:\filezilla.exe"
+          Start-Process "C:\filezilla.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          Write-Host "✅ 网络工具安装完成"
+
+      - name: 11. Install Software - Media Creation & Design
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          # GIMP（图像编辑）
+          Write-Host "🎨 安装 GIMP..."
+          Invoke-WebRequest "https://download.gimp.org/mirror/pub/gimp/v2.10/windows/gimp-2.10.38-setup.exe" -OutFile "C:\gimp.exe"
+          Start-Process "C:\gimp.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # Krita（绘画）
+          Write-Host "🖌️ 安装 Krita..."
+          Invoke-WebRequest "https://download.kde.org/stable/krita/5.2.6/krita-5.2.6-x64-64.exe" -OutFile "C:\krita.exe"
+          Start-Process "C:\krita.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # FFmpeg（命令行音视频处理）
+          Write-Host "🎬 安装 FFmpeg..."
+          Invoke-WebRequest "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile "C:\ffmpeg.zip"
+          Expand-Archive "C:\ffmpeg.zip" -DestinationPath "C:\ffmpeg" -Force
+          # 加入 PATH
+          $ffmpegBin = (Get-ChildItem "C:\ffmpeg\bin" -Filter "ffmpeg.exe" -Recurse | Select-Object -First 1).DirectoryName
+          $envPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          [Environment]::SetEnvironmentVariable("Path", "$envPath;$ffmpegBin", "Machine")
+
+          # HandBrake（视频转码）
+          Write-Host "📀 安装 HandBrake..."
+          Invoke-WebRequest "https://github.com/HandBrake/HandBrake/releases/download/1.9.0/HandBrake-1.9.0-x86_64-Win_GUI.exe" -OutFile "C:\handbrake.exe"
+          Start-Process "C:\handbrake.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+
+          # Audacity（音频编辑）
+          Write-Host "🎵 安装 Audacity..."
+          Invoke-WebRequest "https://github.com/audacity/audacity/releases/download/Audacity-3.7.0/audacity-win-3.7.0-x64.exe" -OutFile "C:\audacity.exe"
+          Start-Process "C:\audacity.exe" -ArgumentList "/silent" -Wait -ErrorAction SilentlyContinue
+
+          # ScreenToGif（GIF 录制）
+          Write-Host "🎞️ 安装 ScreenToGif..."
+          Invoke-WebRequest "https://github.com/NickeManarin/ScreenToGif/releases/download/2.41/ScreenToGif.2.41.Setup.exe" -OutFile "C:\screentogif.exe"
+          Start-Process "C:\screentogif.exe" -ArgumentList "/SILENT" -Wait -ErrorAction SilentlyContinue
+
+          Write-Host "✅ 媒体创作软件安装完成"
+
+      - name: 12. Install Software - Utilities & System
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          # winget 批量安装工具类
+          Write-Host "⚡ winget 批量安装..."
+          $wingetApps = @(
+            "RARLab.WinRAR",
+            "Microsoft.DotNet.SDK.8",
+            "GoLang.Go",
+            "OpenJDK.JDK.21",
+            "Docker.DockerDesktop",
+            "Google.Drive",
+            "Zoom.Zoom",
+            "Microsoft.Teams",
+            "Spotify.Spotify",
+            "GitHub.cli",
+            "Microsoft.SQLServerManagementStudio",
+            "WinDirStat.WinDirStat",
+            "CPUID.CPU-Z",
+            "GPU-Z.GPU-Z",
+            "RealVNC.RealVNCViewer"
+          )
+          foreach ($app in $wingetApps) {
+            Write-Host "  → $app"
+            winget install $app --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
+          }
+
+          Write-Host "✅ 系统工具安装完成"
+
+      - name: 13. Update Desktop Shortcuts
+        run: |
+          $desktop = "C:\Users\Public\Desktop"
+          $shell = New-Object -ComObject WScript.Shell
+
+          $shortcuts = @(
+            @{ Name = "LibreOffice.lnk";     Target = "C:\Program Files\LibreOffice\program\soffice.exe" },
+            @{ Name = "OBS Studio.lnk";      Target = "C:\Program Files\obs-studio\bin\64bit\obs64.exe" },
+            @{ Name = "ShareX.lnk";          Target = "C:\Program Files\ShareX\ShareX.exe" },
+            @{ Name = "GIMP.lnk";            Target = "C:\Program Files\GIMP 2\bin\gimp-2.10.exe" },
+            @{ Name = "Krita.lnk";           Target = "C:\Program Files\Krita\bin\krita.exe" },
+            @{ Name = "HandBrake.lnk";       Target = "C:\Program Files\HandBrake\HandBrake.exe" },
+            @{ Name = "Audacity.lnk";        Target = "C:\Program Files\Audacity\audacity.exe" },
+            @{ Name = "ScreenToGif.lnk";     Target = "C:\Program Files\ScreenToGif\ScreenToGif.exe" },
+            @{ Name = "Nmap.lnk";            Target = "C:\Program Files (x86)\Nmap\zenmap.exe" },
+            @{ Name = "Wireshark.lnk";       Target = "C:\Program Files\Wireshark\Wireshark.exe" },
+            @{ Name = "FileZilla.lnk";      Target = "C:\Program Files\FileZilla FTP Client\filezilla.exe" },
+            @{ Name = "Clash Verge.lnk";     Target = "C:\Program Files\Clash Verge\Clash Verge.exe" },
+            @{ Name = "OpenVPN.lnk";        Target = "C:\Program Files\OpenVPN\bin\openvpn-gui.exe" },
+            @{ Name = "WinRAR.lnk";         Target = "C:\Program Files\WinRAR\WinRAR.exe" },
+            @{ Name = "Flow Launcher.lnk";  Target = "C:\Program Files\Flow Launcher\Flow.Launcher.exe" },
+            @{ Name = "Spotify.lnk";        Target = "$env:LOCALAPPDATA\Microsoft\WindowsApps\Spotify.exe" },
+            @{ Name = "CPU-Z.lnk";          Target = "C:\Program Files\CPU-Z\cpuz_x64.exe" },
+            @{ Name = "WinDirStat.lnk";     Target = "C:\Program Files (x86)\WinDirStat\windirstat.exe" }
+          )
+
+          foreach ($s in $shortcuts) {
+            $target = $s.Target -replace ' --processStart.*', ''
+            if (Test-Path $target) {
+              $lnk = $shell.CreateShortcut("$desktop\$($s.Name)")
+              $lnk.TargetPath = $s.Target.Split(' ')[0]
+              if ($s.Target -match '--processStart') {
+                $lnk.Arguments = ($s.Target -split ' ', 2)[1]
+              }
+              $lnk.Save()
+              Write-Host "  ✅ $($s.Name)"
+            } else {
+              Write-Host "  ⚠️ 跳过 $($s.Name)"
+            }
+          }
+          Write-Host "✅ 桌面快捷方式更新完成"
+
+      - name: 14. Cleanup Temp Files
+        run: |
+          Write-Host "🧹 清理临时安装文件..."
+          $files = @("C:\chrome.exe","C:\firefox.exe","C:\7z.exe","C:\npp.exe","C:\everything.exe",
+                      "C:\vlc.exe","C:\qbittorrent.exe","C:\telegram.exe","C:\potplayer.exe",
+                      "C:\idm.exe","C:\winscp.exe","C:\anydesk.exe","C:\tailscale_gui.msi",
+                      "C:\tailscale.msi","C:\pwsh7.msi",
+                      "C:\libreoffice.msi","C:\sumatra.exe","C:\obs.exe","C:\sharex.exe","C:\flow.exe",
+                      "C:\nmap.exe","C:\wireshark.exe","C:\openvpn.msi","C:\protonvpn.exe","C:\clash.msi","C:\filezilla.exe",
+                      "C:\gimp.exe","C:\krita.exe","C:\ffmpeg.zip","C:\handbrake.exe","C:\audacity.exe","C:\screentogif.exe")
+          foreach ($f in $files) {
+            if (Test-Path $f) {
+              Remove-Item $f -Force -ErrorAction SilentlyContinue
+            }
+          }
+          # 清理 winget 缓存
+          Remove-Item "C:\Users\*\AppData\Local\Packages\Microsoft.DesktopAppInstaller_*\LocalCache" -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "✅ 清理完成"
+
+      - name: 15. Keep Server Alive
+        run: |
+          $hours = [double]"${{ github.event.inputs.keep_alive_hours }}"
+          $totalMinutes = [int]($hours * 60) - 10
+          $endTime = (Get-Date).AddMinutes($totalMinutes)
+
+          Write-Host "⏰ 保活 $hours 小时，预计结束时间: $endTime (UTC)"
+          Write-Host "⏰ GitHub runner 最长 5.5 小时（330 分钟）"
+
+          $i = 0
+          while ((Get-Date) -lt $endTime) {
+              Start-Sleep -Seconds 60
+              $i++
+              $remaining = [int](($endTime - (Get-Date)).TotalMinutes)
+              Write-Host "[$i] 运行中... 剩余约 $remaining 分钟"
+          }
+
+          Write-Host "⏰ 保活结束，runner 即将退出。"
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "  ⚠️ RDP 会话即将断开" -ForegroundColor Red
+          Write-Host "  请保存你的工作！" -ForegroundColor Yellow
+          Write-Host "==========================================" -ForegroundColor Green
