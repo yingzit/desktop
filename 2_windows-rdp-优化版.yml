@@ -1,0 +1,361 @@
+name: Windows Cloud RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_alive_hours:
+        description: "保活时长（小时，最大 5.5）"
+        required: false
+        default: "5"
+      vpn_mode:
+        description: "VPN 方式（tailscale 或 ngrok）"
+        required: false
+        default: "tailscale"
+        type: choice
+        options:
+          - tailscale
+          - ngrok
+      install_profiles:
+        description: "安装套件（逗号分隔: base,dev,media,net,office,create,util；all=全部）"
+        required: false
+        default: "all"
+      parallel_install:
+        description: "并行安装软件（true/false）"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+env:
+  RDP_USER: NvdAdmin
+  INSTALL_DIR: D:\Program Files
+  TEMP_DIR: D:\Temp
+  DESKTOP_DIR: D:\Desktop
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 330
+
+    steps:
+    - name: 0. Setup D Drive / Password
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        $dirs = @("D:\Program Files","D:\Temp","D:\Tools","D:\Desktop","D:\Users","D:\Users\Public","D:\Downloads","D:\Documents")
+        foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        $reg = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        Set-ItemProperty -Path $reg -Name "Desktop" -Value "D:\Desktop" -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $reg -Name "Personal" -Value "D:\Documents" -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $reg -Name "{374DE290-123F-4565-9164-9C5D6E4F7C17}" -Value "D:\Downloads" -ErrorAction SilentlyContinue
+        [Environment]::SetEnvironmentVariable("TEMP","D:\Temp","Machine")
+        [Environment]::SetEnvironmentVariable("TMP","D:\Temp","Machine")
+        $chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*"
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        $password = New-Object char[] 16; $bytes = New-Object byte[] 1
+        for ($i=0; $i -lt 16; $i++) { $rng.GetBytes($bytes); $password[$i] = $chars[$bytes[0] % $chars.Length] }
+        $rdpPassword = -join $password
+        echo "RDP_PASSWORD=$rdpPassword" >> $env:GITHUB_ENV
+        echo "::add-mask::$rdpPassword"
+        $vpnMode = "${{ github.event.inputs.vpn_mode }}"
+        if ($vpnMode -eq "tailscale" -and [string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) { Write-Host "::error::TAILSCALE_AUTHKEY 未配置"; exit 1 }
+        if ($vpnMode -eq "ngrok" -and [string]::IsNullOrWhiteSpace($env:NGROK_AUTH_TOKEN)) { Write-Host "::error::NGROK_AUTH_TOKEN 未配置"; exit 1 }
+        Write-Host "D 盘就绪 | VPN: $vpnMode"
+      env:
+        TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+
+    - name: 1. Enable RDP & Firewall
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+        Write-Host "远程桌面已开启"
+
+    - name: 2. Create Admin Account
+      run: |
+        $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+        New-LocalUser -Name $env:RDP_USER -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+        Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+        net user runneradmin $env:RDP_PASSWORD
+        Write-Host "管理员账户 $env:RDP_USER 已创建"
+      env:
+        RDP_USER: ${{ env.RDP_USER }}
+        RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
+
+    - name: 3. Connect VPN (Tailscale / Ngrok)
+      run: |
+        function Invoke-DownloadRetry {
+          param([string]$Uri,[string]$OutFile,[int]$MaxRetries=3)
+          $i=0
+          while($i -lt $MaxRetries){
+            try { Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop; return $true }
+            catch { $i++; Write-Host ("  [retry {0}] {1} 错误: {2}" -f $i,$Uri,$_); Start-Sleep -Seconds 5 }
+          }
+          Write-Host ("::warning::下载失败(已重试{0}次): {1}" -f $MaxRetries,$Uri); return $false
+        }
+        function Install-Exe {
+          param([string]$Name,[string]$Uri,[string]$ExeArgs=("/S"),[int]$Retries=3)
+          $out = "D:\Temp\$Name.exe"
+          if(-not (Invoke-DownloadRetry -Uri $Uri -OutFile $out -MaxRetries $Retries)){ return }
+          try { Start-Process $out -ArgumentList $ExeArgs -Wait -ErrorAction Stop; Write-Host ("  [OK] {0}" -f $Name) }
+          catch { Write-Host ("::warning::{0} 安装异常: {1}" -f $Name,$_) }
+          finally { Remove-Item $out -Force -ErrorAction SilentlyContinue }
+        }
+        function Install-Msi {
+          param([string]$Name,[string]$Uri,[string]$InstallDir,[int]$Retries=3)
+          $out = "D:\Temp\$Name.msi"
+          if(-not (Invoke-DownloadRetry -Uri $Uri -OutFile $out -MaxRetries $Retries)){ return }
+          try { Start-Process msiexec -ArgumentList "/i `"$out`" /quiet /norestart INSTALLDIR=`"$InstallDir`"" -Wait -ErrorAction Stop; Write-Host ("  [OK] {0}" -f $Name) }
+          catch { Write-Host ("::warning::{0} 安装异常: {1}" -f $Name,$_) }
+          finally { Remove-Item $out -Force -ErrorAction SilentlyContinue }
+        }
+        function Install-Winget {
+          param([string]$App)
+          try { winget install $App --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --location "D:\Program Files" 2>&1 | Out-Null; Write-Host ("  [OK] {0}" -f $App) }
+          catch { Write-Host ("::warning::{0} winget 异常: {1}" -f $App,$_) }
+        }
+        $vpnMode = "${{ github.event.inputs.vpn_mode }}"; $ts_ip = ""
+        if ($vpnMode -eq "tailscale") {
+          Invoke-DownloadRetry -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "D:\Temp\tailscale.msi" | Out-Null
+          Start-Process msiexec -ArgumentList "/i D:\Temp\tailscale.msi /quiet /norestart INSTALLDIR=D:\Program Files\Tailscale" -Wait
+          Start-Sleep -Seconds 5
+          $tsExe = "D:\Program Files\Tailscale\tailscale.exe"
+          & $tsExe up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp" 2>&1
+          Start-Sleep -Seconds 10
+          $ts_ip = (& $tsExe ip -4).Trim()
+          if ([string]::IsNullOrWhiteSpace($ts_ip)) { Write-Host "::error::Tailscale IP 获取失败"; exit 1 }
+        } elseif ($vpnMode -eq "ngrok") {
+          Invoke-DownloadRetry -Uri "https://bin.equinox.io/c/bNrdb6J64Gw/ngrok-v3-stable-windows-amd64.zip" -OutFile "D:\Temp\ngrok.zip" | Out-Null
+          Expand-Archive "D:\Temp\ngrok.zip" -DestinationPath "D:\Tools\ngrok" -Force
+          & "D:\Tools\ngrok\ngrok.exe" config add-authtoken $env:NGROK_AUTH_TOKEN 2>&1
+          Start-Process "D:\Tools\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -WindowStyle Hidden
+          $retry = 0
+          while ($retry -lt 10) {
+            try {
+              $resp = Invoke-WebRequest "http://127.0.0.1:4040/api/tunnels" -UseBasicParsing -TimeoutSec 5
+              $tunnels = $resp.Content | ConvertFrom-Json
+              $ts_ip = $tunnels.tunnels[0].public_url -replace "tcp://",""
+              if ($ts_ip) { break }
+            } catch {}
+            Start-Sleep -Seconds 2; $retry++
+          }
+          if ([string]::IsNullOrWhiteSpace($ts_ip)) { Write-Host "::error::ngrok 隧道获取失败"; exit 1 }
+        }
+        $endTime = (Get-Date).AddHours([double]"${{ github.event.inputs.keep_alive_hours }}")
+        echo "RDP_ADDRESS=$ts_ip" >> $env:GITHUB_ENV
+        Write-Host "::notice title=RDP Address::$ts_ip"
+        Write-Host "::notice title=RDP Username::$env:RDP_USER"
+        Write-Host "::notice title=RDP Password::$env:RDP_PASSWORD"
+        Write-Host "::notice title=End Time (UTC)::$endTime"
+        $info = @("RDP 连接信息","================","Address : $ts_ip","Username: $env:RDP_USER","Password: $env:RDP_PASSWORD","VPN Mode: $vpnMode","End Time: $endTime (UTC)","================")
+        $info | Out-File -FilePath "D:\Desktop\RDP_INFO.txt" -Encoding ASCII
+        Write-Host ">>> RDP READY | mstsc: $ts_ip | 信息已写入 D:\Desktop\RDP_INFO.txt"
+      env:
+        TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+
+    - name: Restore Installer Cache
+      uses: actions/cache@v4
+      continue-on-error: true
+      with:
+        path: D:\Temp\cache
+        key: installers-${{ github.event.inputs.install_profiles }}-${{ github.run_id }}
+        restore-keys: |
+          installers-${{ github.event.inputs.install_profiles }}-
+          installers-
+
+    - name: 4. Install Software (Profiles/Parallel/Retry)
+      run: |
+        function Invoke-DownloadRetry {
+          param([string]$Uri,[string]$OutFile,[int]$MaxRetries=3)
+          $i=0
+          while($i -lt $MaxRetries){
+            try { Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -ErrorAction Stop; return $true }
+            catch { $i++; Write-Host ("  [retry {0}] {1} 错误: {2}" -f $i,$Uri,$_); Start-Sleep -Seconds 5 }
+          }
+          Write-Host ("::warning::下载失败(已重试{0}次): {1}" -f $MaxRetries,$Uri); return $false
+        }
+        function Install-Exe {
+          param([string]$Name,[string]$Uri,[string]$ExeArgs=("/S"),[int]$Retries=3)
+          $out = "D:\Temp\$Name.exe"
+          if(-not (Invoke-DownloadRetry -Uri $Uri -OutFile $out -MaxRetries $Retries)){ return }
+          try { Start-Process $out -ArgumentList $ExeArgs -Wait -ErrorAction Stop; Write-Host ("  [OK] {0}" -f $Name) }
+          catch { Write-Host ("::warning::{0} 安装异常: {1}" -f $Name,$_) }
+          finally { Remove-Item $out -Force -ErrorAction SilentlyContinue }
+        }
+        function Install-Msi {
+          param([string]$Name,[string]$Uri,[string]$InstallDir,[int]$Retries=3)
+          $out = "D:\Temp\$Name.msi"
+          if(-not (Invoke-DownloadRetry -Uri $Uri -OutFile $out -MaxRetries $Retries)){ return }
+          try { Start-Process msiexec -ArgumentList "/i `"$out`" /quiet /norestart INSTALLDIR=`"$InstallDir`"" -Wait -ErrorAction Stop; Write-Host ("  [OK] {0}" -f $Name) }
+          catch { Write-Host ("::warning::{0} 安装异常: {1}" -f $Name,$_) }
+          finally { Remove-Item $out -Force -ErrorAction SilentlyContinue }
+        }
+        function Install-Winget {
+          param([string]$App)
+          try { winget install $App --silent --accept-package-agreements --accept-source-agreements --disable-interactivity --location "D:\Program Files" 2>&1 | Out-Null; Write-Host ("  [OK] {0}" -f $App) }
+          catch { Write-Host ("::warning::{0} winget 异常: {1}" -f $App,$_) }
+        }
+        $profiles = "${{ github.event.inputs.install_profiles }}"; $parallel = "${{ github.event.inputs.parallel_install }}"
+        $p = @($profiles -split ',' | ForEach-Object { $_.Trim().ToLower() })
+        $want = { param($k) ($p -contains 'all') -or ($p -contains $k) }
+        $tasks = @()
+        if (&$want 'base') {
+          $tasks += @(
+            @{N='chrome'; T='exe'; U='https://dl.google.com/chrome/install/latest/chrome_installer.exe'; A='/silent /install /D=D:\Program Files\Google\Chrome'},
+            @{N='firefox'; T='exe'; U='https://download.mozilla.org/?product=firefox-latest-ssl&os=win64&lang=zh-CN'; A='/S /D=D:\Program Files\Mozilla Firefox'},
+            @{N='7z'; T='exe'; U='https://www.7-zip.org/a/7z2409-x64.exe'; A='/S /D=D:\Program Files\7-Zip'},
+            @{N='npp'; T='exe'; U='https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.6.9/npp.8.6.9.Installer.x64.exe'; A='/S /D=D:\Program Files\Notepad++'},
+            @{N='everything'; T='exe'; U='https://www.voidtools.com/Everything-1.4.1.1024.x64-Setup.exe'; A='/S /D=D:\Program Files\Everything'})
+        }
+        if (&$want 'dev') { $tasks += @{N='pwsh7'; T='msi'; U='https://github.com/PowerShell/PowerShell/releases/latest/download/PowerShell-7.4.6-win-x64.msi'; D='D:\Program Files\PowerShell\7'} }
+        if (&$want 'media') {
+          $tasks += @(
+            @{N='vlc'; T='exe'; U='https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.exe'; A='/S /D=D:\Program Files\VLC'},
+            @{N='potplayer'; T='exe'; U='https://potplayer.tv/download/PotPlayerSetup64.exe'; A='/S /D=D:\Program Files\PotPlayer'},
+            @{N='qbittorrent'; T='exe'; U='https://sourceforge.net/projects/qbittorrent/files/qbittorrent-win32/qbittorrent-5.0.2/qbittorrent_5.0.2_x64_setup.exe/download'; A='/S /D=D:\Program Files\qBittorrent'},
+            @{N='telegram'; T='exe'; U='https://telegram.org/dl/desktop/win64'; A='/S /D=D:\Program Files\Telegram Desktop'})
+        }
+        if (&$want 'net') {
+          $tasks += @(
+            @{N='idm'; T='exe'; U='https://download3.internetdownloadmanager.com/idman642build28.exe'; A='/silent /norestart /D=D:\Program Files\IDM'},
+            @{N='winscp'; T='exe'; U='https://winscp.net/download/WinSCP-6.3.6-Setup.exe'; A='/SILENT /DIR=D:\Program Files\WinSCP'},
+            @{N='nmap'; T='exe'; U='https://nmap.org/dist/nmap-7.95-setup.exe'; A='/S /D=D:\Program Files\Nmap'},
+            @{N='wireshark'; T='exe'; U='https://2.na.dl.wireshark.org/win64/Wireshark-4.4.2.exe'; A='/S /D=D:\Program Files\Wireshark'},
+            @{N='openvpn'; T='msi'; U='https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.12-I001-amd64.msi'; D='D:\Program Files\OpenVPN'},
+            @{N='clash'; T='msi'; U='https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.0.2/Clash.Verge_2.0.2_x64_en-US.msi'; D='D:\Program Files\Clash Verge'},
+            @{N='filezilla'; T='exe'; U='https://download.filezilla-project.org/client/FileZilla_3.65.1_win64-setup.exe'; A='/S /D=D:\Program Files\FileZilla'})
+        }
+        if (&$want 'office') {
+          $tasks += @(
+            @{N='libreoffice'; T='msi'; U='https://download.documentfoundation.org/libreoffice/stable/25.2.5/win/x86_64/LibreOffice_25.2.5_Win_x86-64.msi'; D='D:\Program Files\LibreOffice'},
+            @{N='sumatra'; T='exe'; U='https://www.sumatrapdfreader.org/dl/SumatraPDF-3.5.2-64.exe'; A='/silent /D=D:\Program Files\SumatraPDF'},
+            @{N='obs'; T='exe'; U='https://github.com/obsproject/obs-studio/releases/download/30.2.6/OBS-Studio-30.2.6-Windows-Installer.exe'; A='/S /D=D:\Program Files\obs-studio'},
+            @{N='sharex'; T='exe'; U='https://getsharex.com/downloads/ShareX-16.0.4-setup.exe'; A='/silent /D=D:\Program Files\ShareX'},
+            @{N='flow'; T='exe'; U='https://github.com/Flow-Launcher/Flow.Launcher/releases/download/v1.20.0/Flow-Launcher-Setup.exe'; A='/silent /D=D:\Program Files\Flow Launcher'})
+        }
+        if (&$want 'create') {
+          $tasks += @(
+            @{N='gimp'; T='exe'; U='https://download.gimp.org/mirror/pub/gimp/v2.10/windows/gimp-2.10.38-setup.exe'; A='/S /D=D:\Program Files\GIMP 2'},
+            @{N='krita'; T='exe'; U='https://download.kde.org/stable/krita/5.2.6/krita-5.2.6-x64-64.exe'; A='/S /D=D:\Program Files\Krita'},
+            @{N='handbrake'; T='exe'; U='https://github.com/HandBrake/HandBrake/releases/download/1.9.0/HandBrake-1.9.0-x86_64-Win_GUI.exe'; A='/S /D=D:\Program Files\HandBrake'},
+            @{N='audacity'; T='exe'; U='https://github.com/audacity/audacity/releases/download/Audacity-3.7.0/audacity-win-3.7.0-x64.exe'; A='/silent /D=D:\Program Files\Audacity'},
+            @{N='screentogif'; T='exe'; U='https://github.com/NickeManarin/ScreenToGif/releases/download/2.41/ScreenToGif.2.41.Setup.exe'; A='/SILENT /D=D:\Program Files\ScreenToGif'})
+        }
+        if (&$want 'util') { $tasks += @{N='ffmpeg'; T='zip'; U='https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip'; D='D:\Tools\ffmpeg'} }
+        $wingetApps = @()
+        if (&$want 'dev')  { $wingetApps += @('Git.Git','Microsoft.VisualStudioCode','Python.Python.3.12','OpenJS.NodeJS.LTS','Microsoft.PowerToys','Microsoft.PowerShell') }
+        if (&$want 'util') { $wingetApps += @('RARLab.WinRAR','Microsoft.DotNet.SDK.8','GoLang.Go','Google.Drive','Zoom.Zoom','GitHub.cli','WinDirStat.WinDirStat','CPUID.CPU-Z','RealVNC.RealVNCViewer') }
+        Write-Host "winget 串行安装 ($($wingetApps.Count) 个)..."
+        foreach ($a in $wingetApps) { Install-Winget -App $a }
+        $jobs = @()
+        foreach ($t in $tasks) {
+          if ($t.T -eq 'zip' -or $parallel -eq 'false') {
+            switch ($t.T) {
+              'exe' { Install-Exe -Name $t.N -Uri $t.U -ExeArgs $t.A }
+              'msi' { Install-Msi -Name $t.N -Uri $t.U -InstallDir $t.D }
+              'zip' {
+                $out = "D:\Temp\$($t.N).zip"
+                if (Invoke-DownloadRetry -Uri $t.U -OutFile $out) {
+                  Expand-Archive $out -DestinationPath $t.D -Force
+                  $bin = (Get-ChildItem $t.D -Filter '*.exe' -Recurse | Select-Object -First 1).DirectoryName
+                  if ($bin) { $pe = [Environment]::GetEnvironmentVariable('Path','Machine'); [Environment]::SetEnvironmentVariable('Path', "$pe;$bin", 'Machine'); $env:Path += ";$bin" }
+                  Write-Host "  [OK] $($t.N)"
+                }
+                Remove-Item $out -Force -ErrorAction SilentlyContinue
+              }
+            }
+          } else {
+            $jobs += Start-Job -ArgumentList $t -ScriptBlock {
+              param($t)
+              $out = "D:\Temp\$($t.N).exe"; $ok=$false; $i=0
+              while ($i -lt 3 -and -not $ok) { try { Invoke-WebRequest -Uri $t.U -OutFile $out -UseBasicParsing -EA Stop; $ok=$true } catch { $i++; Start-Sleep 5 } }
+              if ($ok) {
+                if ($t.T -eq 'exe') { Start-Process $out -ArgumentList $t.A -Wait -EA SilentlyContinue }
+                elseif ($t.T -eq 'msi') { Start-Process msiexec -ArgumentList "/i `"$out`" /quiet /norestart" -Wait -EA SilentlyContinue }
+                Write-Host "  [OK-job] $($t.N)"
+              } else { Write-Host "::warning::[job] $($t.N) 下载失败" }
+              Remove-Item $out -Force -EA SilentlyContinue
+            }
+          }
+        }
+        if ($jobs.Count -gt 0) {
+          Write-Host ("并行任务 {0} 个" -f $jobs.Count)
+          $jobs | Wait-Job -Timeout 1500 | Receive-Job
+          $jobs | Remove-Job -Force -EA SilentlyContinue
+        }
+        Write-Host "软件安装阶段完成"
+
+    - name: 5. Shortcuts & System Tweaks
+      run: |
+        $desktop = "D:\Desktop"; $shell = New-Object -ComObject WScript.Shell
+        $shortcuts = @(
+          @{Name='Chrome.lnk';Path='D:\Program Files\Google\Chrome\Application\chrome.exe'},
+          @{Name='Firefox.lnk';Path='D:\Program Files\Mozilla Firefox\firefox.exe'},
+          @{Name='VS Code.lnk';Path='D:\Program Files\Microsoft VS Code\Code.exe'},
+          @{Name='Notepad++.lnk';Path='D:\Program Files\Notepad++\notepad++.exe'},
+          @{Name='7-Zip.lnk';Path='D:\Program Files\7-Zip\7zFM.exe'},
+          @{Name='Everything.lnk';Path='D:\Program Files\Everything\Everything.exe'},
+          @{Name='PowerShell 7.lnk';Path='D:\Program Files\PowerShell\7\pwsh.exe'},
+          @{Name='VLC.lnk';Path='D:\Program Files\VLC\vlc.exe'},
+          @{Name='PotPlayer.lnk';Path='D:\Program Files\PotPlayer\PotPlayerMini64.exe'},
+          @{Name='qBittorrent.lnk';Path='D:\Program Files\qBittorrent\qbittorrent.exe'},
+          @{Name='Telegram.lnk';Path='D:\Program Files\Telegram Desktop\Telegram.exe'},
+          @{Name='WinSCP.lnk';Path='D:\Program Files\WinSCP\WinSCP.exe'},
+          @{Name='IDM.lnk';Path='D:\Program Files\IDM\IDMan.exe'},
+          @{Name='LibreOffice.lnk';Path='D:\Program Files\LibreOffice\program\soffice.exe'},
+          @{Name='SumatraPDF.lnk';Path='D:\Program Files\SumatraPDF\SumatraPDF.exe'},
+          @{Name='OBS Studio.lnk';Path='D:\Program Files\obs-studio\bin\64bit\obs64.exe'},
+          @{Name='ShareX.lnk';Path='D:\Program Files\ShareX\ShareX.exe'},
+          @{Name='Nmap.lnk';Path='D:\Program Files\Nmap\zenmap.exe'},
+          @{Name='Wireshark.lnk';Path='D:\Program Files\Wireshark\Wireshark.exe'},
+          @{Name='FileZilla.lnk';Path='D:\Program Files\FileZilla\filezilla.exe'},
+          @{Name='GIMP.lnk';Path='D:\Program Files\GIMP 2\bin\gimp-2.10.exe'},
+          @{Name='Krita.lnk';Path='D:\Program Files\Krita\bin\krita.exe'},
+          @{Name='HandBrake.lnk';Path='D:\Program Files\HandBrake\HandBrake.exe'},
+          @{Name='Audacity.lnk';Path='D:\Program Files\Audacity\audacity.exe'},
+          @{Name='WinRAR.lnk';Path='D:\Program Files\WinRAR\WinRAR.exe'})
+        $count=0;$skip=0
+        foreach ($s in $shortcuts) {
+          if (Test-Path $s.Path) { $lnk=$shell.CreateShortcut("$desktop\$($s.Name)"); $lnk.TargetPath=$s.Path; $lnk.Save(); $count++ }
+          else { Write-Host "  跳过 $($s.Name)"; $skip++ }
+        }
+        Write-Host "快捷方式 -> D:\Desktop | 创建 $count | 跳过 $skip"
+        Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "ScreenSaveActive" -Value 0
+        powercfg /hibernate off
+        powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c6b3c
+        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "HideFileExt" -Value 0
+        Write-Host "系统优化完成"
+
+    - name: Save Installer Cache
+      uses: actions/cache@v4
+      continue-on-error: true
+      with:
+        path: D:\Temp\cache
+        key: installers-${{ github.event.inputs.install_profiles }}-${{ github.run_id }}
+
+    - name: 6. Cleanup & Summary
+      run: |
+        Get-ChildItem "D:\Temp" -Exclude "cache" -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+        $dApps = (Get-ChildItem "D:\Program Files" -Directory -ErrorAction SilentlyContinue).Count
+        $dSize = [math]::Round((Get-ChildItem "D:\Program Files" -Recurse -EA SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1MB, 0)
+        $dShortcuts = (Get-ChildItem "D:\Desktop" -Filter "*.lnk" -EA SilentlyContinue).Count
+        Write-Host "==========================================" -ForegroundColor Cyan
+        Write-Host "  安装总结 | 目录 $dApps 个 ${dSize}MB | 快捷 $dShortcuts 个" -ForegroundColor Cyan
+        Write-Host "  套件: ${{ github.event.inputs.install_profiles }} | VPN: ${{ github.event.inputs.vpn_mode }} | 保活: ${{ github.event.inputs.keep_alive_hours }} 小时" -ForegroundColor Yellow
+        Write-Host "==========================================" -ForegroundColor Cyan
+
+    - name: 7. Keep Server Alive
+      run: |
+        $hours = [double]"${{ github.event.inputs.keep_alive_hours }}"
+        $endTime = (Get-Date).AddMinutes([int]($hours * 60) - 10)
+        Write-Host "保活 $hours 小时，预计结束: $endTime (UTC)"
+        $i = 0
+        while ((Get-Date) -lt $endTime) {
+          Start-Sleep -Seconds 60; $i++
+          Write-Host ("[$i] 运行中... 剩余约 {0} 分钟" -f [int](($endTime - (Get-Date)).TotalMinutes))
+        }
+        Write-Host "保活结束"
