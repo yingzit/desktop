@@ -114,8 +114,7 @@ jobs:
 
             if ($proxyMode -ne "off") {
               Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
-              Set-Service -Name "RemoteAccess" -StartupType Automatic 2>$null
-              Start-Service -Name "RemoteAccess" 2>$null
+              try { Start-Service -Name "RemoteAccess" -ErrorAction Stop } catch { Write-Host "⚠️ RemoteAccess 服务启动跳过（不影响）" }
             }
 
             $tsArgs = @("up", "--authkey=$Env:TAILSCALE_AUTHKEY", "--hostname=github-rdp")
