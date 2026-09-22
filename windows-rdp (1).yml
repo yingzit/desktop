@@ -1,0 +1,257 @@
+name: Windows Cloud RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_alive_hours:
+        description: "保活时长（小时，最大 5.5）"
+        required: false
+        default: "5"
+      vpn_mode:
+        description: "VPN 方式（tailscale 或 ngrok）"
+        required: false
+        default: "tailscale"
+        type: choice
+        options:
+          - tailscale
+          - ngrok
+      proxy_mode:
+        description: "代理模式（off=仅RDP / exit-node=出口代理 / routes=全流量代理）"
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - off
+          - exit-node
+          - routes
+
+env:
+  RDP_USER: NvdAdmin
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: 0. Generate Random Password & Setup
+        run: |
+          New-Item -ItemType Directory -Force -Path "D:\Temp" | Out-Null
+          New-Item -ItemType Directory -Force -Path "D:\Downloads" | Out-Null
+
+          # 重定向桌面到 D 盘
+          $desktopReg = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+          Set-ItemProperty -Path $desktopReg -Name "Desktop" -Value "D:\Desktop" -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "D:\Desktop" | Out-Null
+
+          # 系统 TEMP 重定向
+          [Environment]::SetEnvironmentVariable("TEMP", "D:\Temp", "Machine")
+          [Environment]::SetEnvironmentVariable("TMP", "D:\Temp", "Machine")
+
+          # 生成随机密码
+          $chars = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#\$%^&*"
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $password = New-Object char[] 16
+          $bytes = New-Object byte[] 1
+          for ($i = 0; $i -lt 16; $i++) {
+            $rng.GetBytes($bytes)
+            $password[$i] = $chars[$bytes[0] % $chars.Length]
+          }
+          $rdpPassword = -join $password
+          echo "RDP_PASSWORD=$rdpPassword" >> $env:GITHUB_ENV
+          echo "::add-mask::$rdpPassword"
+
+          # 校验 Secrets
+          $vpnMode = "${{ github.event.inputs.vpn_mode }}"
+          if ($vpnMode -eq "tailscale" -and [string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            Write-Host "::error::TAILSCALE_AUTHKEY secret 未配置！"
+            exit 1
+          }
+          if ($vpnMode -eq "ngrok" -and [string]::IsNullOrWhiteSpace($env:NGROK_AUTH_TOKEN)) {
+            Write-Host "::error::NGROK_AUTH_TOKEN secret 未配置！"
+            exit 1
+          }
+          Write-Host "✅ 随机密码已生成 | VPN: $vpnMode"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: 1. Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          powercfg /hibernate off
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c6b3c
+          Write-Host "✅ 远程桌面已开启"
+
+      - name: 2. Create Admin Account
+        run: |
+          $Password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          net user runneradmin $env:RDP_PASSWORD
+          Write-Host "✅ 管理员账户 $env:RDP_USER 已创建"
+        env:
+          RDP_USER: ${{ env.RDP_USER }}
+          RDP_PASSWORD: ${{ env.RDP_PASSWORD }}
+
+      - name: 3. Connect VPN
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $vpnMode = "${{ github.event.inputs.vpn_mode }}"
+          $proxyMode = "${{ github.event.inputs.proxy_mode }}"
+          $ts_ip = ""
+
+          if ($vpnMode -eq "tailscale") {
+            Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "D:\Temp\tailscale.msi"
+            Start-Process msiexec -ArgumentList "/i D:\Temp\tailscale.msi /quiet /norestart" -Wait
+            Start-Sleep -Seconds 5
+            $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+
+            if ($proxyMode -ne "off") {
+              Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+              Set-Service -Name "RemoteAccess" -StartupType Automatic 2>$null
+              Start-Service -Name "RemoteAccess" 2>$null
+            }
+
+            $tsArgs = @("up", "--authkey=$Env:TAILSCALE_AUTHKEY", "--hostname=github-rdp")
+            if ($proxyMode -eq "exit-node") { $tsArgs += "--advertise-exit-node"; $tsArgs += "--accept-routes" }
+            elseif ($proxyMode -eq "routes") { $tsArgs += "--advertise-routes=0.0.0.0/0"; $tsArgs += "--accept-routes" }
+            & $tsExe @tsArgs 2>&1
+            Start-Sleep -Seconds 10
+            $ts_ip = & $tsExe ip -4
+            if ([string]::IsNullOrWhiteSpace($ts_ip)) { Write-Host "::error::Tailscale IP 获取失败"; exit 1 }
+            $ts_ip = $ts_ip.Trim()
+
+          } elseif ($vpnMode -eq "ngrok") {
+            Invoke-WebRequest "https://bin.equinox.io/c/bNrdb6J64Gw/ngrok-v3-stable-windows-amd64.zip" -OutFile "D:\Temp\ngrok.zip"
+            Expand-Archive "D:\Temp\ngrok.zip" -DestinationPath "D:\Tools\ngrok" -Force
+            & "D:\Tools\ngrok\ngrok.exe" config add-authtoken $env:NGROK_AUTH_TOKEN 2>&1
+            Start-Process "D:\Tools\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -WindowStyle Hidden
+            Start-Sleep -Seconds 8
+            $retry = 0
+            while ($retry -lt 10) {
+              try {
+                $resp = Invoke-WebRequest "http://127.0.0.1:4040/api/tunnels" -UseBasicParsing -TimeoutSec 5
+                $ts_ip = ($resp.Content | ConvertFrom-Json).tunnels[0].public_url -replace "tcp://",""
+                if ($ts_ip) { break }
+              } catch {}
+              Start-Sleep -Seconds 2; $retry++
+            }
+            if ([string]::IsNullOrWhiteSpace($ts_ip)) { Write-Host "::error::ngrok 失败"; exit 1 }
+          }
+
+          $hours = [double]"${{ github.event.inputs.keep_alive_hours }}"
+          $endTime = (Get-Date).AddHours($hours)
+
+          Write-Host ""
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+          Write-Host "  VPN Mode     : $vpnMode" -ForegroundColor Yellow
+          Write-Host "  Proxy Mode   : $proxyMode" -ForegroundColor Yellow
+          Write-Host "  Address      : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username     : $env:RDP_USER" -ForegroundColor Yellow
+          Write-Host "  Password     : $env:RDP_PASSWORD" -ForegroundColor Yellow
+          Write-Host "  End Time     : $endTime (UTC)" -ForegroundColor Yellow
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "==========================================" -ForegroundColor Green
+
+      - name: 4. Install IDM
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "⬇️ 安装 IDM..."
+          Invoke-WebRequest "https://download3.internetdownloadmanager.com/idman642build28.exe" -OutFile "D:\Temp\idm.exe"
+          Start-Process "D:\Temp\idm.exe" -ArgumentList "/silent /norestart" -Wait -ErrorAction SilentlyContinue
+          $idmPath = Get-ChildItem "C:\Program Files*\Internet Download Manager\IDMan.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($idmPath) { Write-Host "✅ IDM 已安装: $($idmPath.FullName)" } else { Write-Host "⚠️ IDM 安装可能失败" }
+
+      - name: 5. Install qBittorrent
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "📥 安装 qBittorrent..."
+          Invoke-WebRequest "https://sourceforge.net/projects/qbittorrent/files/qbittorrent-win32/qbittorrent-5.0.2/qbittorrent_5.0.2_x64_setup.exe/download" -OutFile "D:\Temp\qbittorrent.exe"
+          Start-Process "D:\Temp\qbittorrent.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+          $qbPath = Get-ChildItem "C:\Program Files*\qBittorrent\qbittorrent.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($qbPath) { Write-Host "✅ qBittorrent 已安装: $($qbPath.FullName)" } else { Write-Host "⚠️ qBittorrent 安装可能失败" }
+
+      - name: 6. Install Telegram
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host "✈️ 安装 Telegram..."
+          Invoke-WebRequest "https://telegram.org/dl/desktop/win64" -OutFile "D:\Temp\telegram.exe"
+          Start-Process "D:\Temp\telegram.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+          $tgPath = Get-ChildItem "C:\Users\*\AppData\Local\Telegram Desktop\Telegram.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $tgPath) { $tgPath = Get-ChildItem "C:\Program Files*\Telegram Desktop\Telegram.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 }
+          if ($tgPath) { Write-Host "✅ Telegram 已安装: $($tgPath.FullName)" } else { Write-Host "⚠️ Telegram 安装可能失败" }
+
+      - name: 7. Desktop Shortcuts & Cleanup
+        run: |
+          $desktop = "D:\Desktop"
+          $shell = New-Object -ComObject WScript.Shell
+
+          # 动态查找已安装软件路径并创建快捷方式
+          $apps = @(
+            @{ Name = "IDM.lnk";          Pattern = "IDMan.exe";           Search = "C:\Program Files*\Internet Download Manager" },
+            @{ Name = "qBittorrent.lnk";  Pattern = "qbittorrent.exe";     Search = "C:\Program Files*\qBittorrent" },
+            @{ Name = "Telegram.lnk";     Pattern = "Telegram.exe";         Search = "C:\Users\*\AppData\Local\Telegram Desktop","C:\Program Files*\Telegram Desktop" }
+          )
+
+          $count = 0
+          foreach ($app in $apps) {
+            $found = $false
+            foreach ($searchPath in $app.Search) {
+              $exe = Get-ChildItem $searchPath -Filter $app.Pattern -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($exe) {
+                $lnk = $shell.CreateShortcut("$desktop\$($app.Name)")
+                $lnk.TargetPath = $exe.FullName
+                $lnk.Save()
+                Write-Host "  ✅ $($app.Name) → $($exe.FullName)"
+                $count++; $found = $true; break
+              }
+            }
+            if (-not $found) { Write-Host "  ⚠️ 跳过 $($app.Name)（未找到）" }
+          }
+          Write-Host "✅ 桌面快捷方式: $count 个"
+
+          # 清理临时文件
+          Remove-Item "D:\Temp\idm.exe","D:\Temp\qbittorrent.exe","D:\Temp\telegram.exe","D:\Temp\tailscale.msi","D:\Temp\ngrok.zip" -Force -ErrorAction SilentlyContinue
+          Write-Host "🧹 临时文件已清理"
+
+          # 显示文件扩展名
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "HideFileExt" -Value 0
+
+          Write-Host ""
+          Write-Host "==========================================" -ForegroundColor Cyan
+          Write-Host "  📋 安装总结" -ForegroundColor Cyan
+          Write-Host "==========================================" -ForegroundColor Cyan
+          Write-Host "  下载工具:   IDM, qBittorrent, Telegram" -ForegroundColor White
+          Write-Host "  下载目录:   D:\Downloads" -ForegroundColor Green
+          Write-Host "  桌面目录:   D:\Desktop" -ForegroundColor Green
+          Write-Host "  快捷方式:   $count 个" -ForegroundColor Green
+          Write-Host "  VPN 模式:   ${{ github.event.inputs.vpn_mode }}" -ForegroundColor Yellow
+          Write-Host "  保活时长:   ${{ github.event.inputs.keep_alive_hours }} 小时" -ForegroundColor Yellow
+          Write-Host "==========================================" -ForegroundColor Cyan
+
+      - name: 8. Keep Server Alive
+        run: |
+          $hours = [double]"${{ github.event.inputs.keep_alive_hours }}"
+          $totalMinutes = [int]($hours * 60) - 10
+          $endTime = (Get-Date).AddMinutes($totalMinutes)
+          Write-Host "⏰ 保活 $hours 小时，结束时间: $endTime (UTC)"
+
+          $i = 0
+          while ((Get-Date) -lt $endTime) {
+              Start-Sleep -Seconds 60
+              $i++
+              $remaining = [int](($endTime - (Get-Date)).TotalMinutes)
+              Write-Host "[$i] 运行中... 剩余约 $remaining 分钟"
+          }
+
+          Write-Host "⏰ 保活结束"
+          Write-Host "==========================================" -ForegroundColor Green
+          Write-Host "  ⚠️ RDP 会话即将断开 — 请保存工作！" -ForegroundColor Red
+          Write-Host "==========================================" -ForegroundColor Green
