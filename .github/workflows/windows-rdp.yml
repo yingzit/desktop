@@ -82,24 +82,49 @@ jobs:
 
           # IDM
           Write-Host "⬇️ 安装 IDM..."
-          Invoke-WebRequest "https://download3.internetdownloadmanager.com/idman642build28.exe" -OutFile "C:\idm.exe"
-          Start-Process "C:\idm.exe" -ArgumentList "/silent /norestart" -Wait -ErrorAction SilentlyContinue
+          $idmUrls = @(
+            "https://download3.internetdownloadmanager.com/idman642build28.exe",
+            "https://www.internetdownloadmanager.com/idman642build28.exe",
+            "https://mirror.internetdownloadmanager.com/idman642build28.exe"
+          )
+          $idmInstalled = $false
+          foreach ($url in $idmUrls) {
+            try {
+              Invoke-WebRequest $url -OutFile "C:\idm.exe" -ErrorAction Stop
+              Start-Process "C:\idm.exe" -ArgumentList "/silent /norestart" -Wait -ErrorAction SilentlyContinue
+              $idmInstalled = $true
+              break
+            } catch { Write-Host "  ⚠️ $url 失败，尝试下一个..." }
+          }
+          if (!$idmInstalled) { Write-Host "  ⚠️ IDM 所有下载源失败，跳过" }
           $idm = Get-ChildItem "C:\Program Files*\Internet Download Manager\IDMan.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($idm) { Write-Host "  ✅ IDM: $($idm.FullName)" } else { Write-Host "  ⚠️ IDM 未找到" }
+          if ($idm) { Write-Host "  ✅ IDM: $($idm.FullName)" } else { Write-Host "  ⚠️ IDM 未安装" }
 
           # qBittorrent
           Write-Host "📥 安装 qBittorrent..."
-          Invoke-WebRequest "https://sourceforge.net/projects/qbittorrent/files/qbittorrent-win32/qbittorrent-5.0.2/qbittorrent_5.0.2_x64_setup.exe/download" -OutFile "C:\qb.exe"
-          Start-Process "C:\qb.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+          $qbUrls = @(
+            "https://sourceforge.net/projects/qbittorrent/files/qbittorrent-win32/qbittorrent-5.0.2/qbittorrent_5.0.2_x64_setup.exe/download",
+            "https://github.com/qbittorrent/qBittorrent/releases/download/release-5.0.2/qbittorrent_5.0.2_x64_setup.exe"
+          )
+          $qbInstalled = $false
+          foreach ($url in $qbUrls) {
+            try {
+              Invoke-WebRequest $url -OutFile "C:\qb.exe" -ErrorAction Stop
+              Start-Process "C:\qb.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+              $qbInstalled = $true
+              break
+            } catch { Write-Host "  ⚠️ qBittorrent 下载源失败，尝试下一个..." }
+          }
+          if (!$qbInstalled) { Write-Host "  ⚠️ qBittorrent 所有下载源失败，跳过" }
           $qb = Get-ChildItem "C:\Program Files*\qBittorrent\qbittorrent.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($qb) { Write-Host "  ✅ qBittorrent: $($qb.FullName)" } else { Write-Host "  ⚠️ qBittorrent 未找到" }
+          if ($qb) { Write-Host "  ✅ qBittorrent: $($qb.FullName)" } else { Write-Host "  ⚠️ qBittorrent 未安装" }
 
           # Telegram
           Write-Host "✈️ 安装 Telegram..."
           Invoke-WebRequest "https://telegram.org/dl/desktop/win64" -OutFile "C:\tg.exe"
           Start-Process "C:\tg.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
           $tg = Get-ChildItem "C:\Users\*\AppData\Local\Telegram Desktop\Telegram.exe","C:\Program Files*\Telegram Desktop\Telegram.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($tg) { Write-Host "  ✅ Telegram: $($tg.FullName)" } else { Write-Host "  ⚠️ Telegram 未找到" }
+          if ($tg) { Write-Host "  ✅ Telegram: $($tg.FullName)" } else { Write-Host "  ⚠️ Telegram 未安装" }
 
           Write-Host "✅ 下载工具安装完成 | 下载目录: D:\Downloads"
 
