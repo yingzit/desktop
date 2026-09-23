@@ -2,6 +2,15 @@ name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      proxy_mode:
+        description: "代理模式（off=仅RDP / exit-node=出口代理）"
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - off
+          - exit-node
 
 jobs:
   build:
@@ -26,13 +35,26 @@ jobs:
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
+          $proxyMode = "${{ github.event.inputs.proxy_mode }}"
+
+          # 开启 IP 转发（代理模式需要）
+          if ($proxyMode -eq "exit-node") {
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+            try { Start-Service -Name "RemoteAccess" -ErrorAction Stop } catch {}
+          }
+
           # Download and install Tailscale silently
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
 
           # Connect to Tailscale network
           Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          $tsArgs = @("up", "--authkey=$Env:TAILSCALE_AUTHKEY", "--hostname=github-rdp")
+          if ($proxyMode -eq "exit-node") {
+            $tsArgs += "--advertise-exit-node"
+            $tsArgs += "--accept-routes"
+          }
+          & "C:\Program Files\Tailscale\tailscale.exe" @tsArgs 2>&1
 
           Start-Sleep -Seconds 8
 
@@ -45,10 +67,71 @@ jobs:
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
           Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
           Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
+          Write-Host "  Proxy Mode   : $proxyMode" -ForegroundColor Yellow
+          if ($proxyMode -eq "exit-node") {
+            Write-Host "  >> Approve: https://login.tailscale.com/admin/machines" -ForegroundColor Magenta
+            Write-Host "  >> Use:     tailscale set --exit-node=github-rdp" -ForegroundColor Magenta
+          }
           Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==========================================" -ForegroundColor Green
 
-      - name: 4. Keep Server Alive (5.5 Hours)
+      - name: 4. Install Download Tools
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force -Path "D:\Downloads" | Out-Null
+
+          # IDM
+          Write-Host "⬇️ 安装 IDM..."
+          Invoke-WebRequest "https://download3.internetdownloadmanager.com/idman642build28.exe" -OutFile "C:\idm.exe"
+          Start-Process "C:\idm.exe" -ArgumentList "/silent /norestart" -Wait -ErrorAction SilentlyContinue
+          $idm = Get-ChildItem "C:\Program Files*\Internet Download Manager\IDMan.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($idm) { Write-Host "  ✅ IDM: $($idm.FullName)" } else { Write-Host "  ⚠️ IDM 未找到" }
+
+          # qBittorrent
+          Write-Host "📥 安装 qBittorrent..."
+          Invoke-WebRequest "https://sourceforge.net/projects/qbittorrent/files/qbittorrent-win32/qbittorrent-5.0.2/qbittorrent_5.0.2_x64_setup.exe/download" -OutFile "C:\qb.exe"
+          Start-Process "C:\qb.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+          $qb = Get-ChildItem "C:\Program Files*\qBittorrent\qbittorrent.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($qb) { Write-Host "  ✅ qBittorrent: $($qb.FullName)" } else { Write-Host "  ⚠️ qBittorrent 未找到" }
+
+          # Telegram
+          Write-Host "✈️ 安装 Telegram..."
+          Invoke-WebRequest "https://telegram.org/dl/desktop/win64" -OutFile "C:\tg.exe"
+          Start-Process "C:\tg.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+          $tg = Get-ChildItem "C:\Users\*\AppData\Local\Telegram Desktop\Telegram.exe","C:\Program Files*\Telegram Desktop\Telegram.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($tg) { Write-Host "  ✅ Telegram: $($tg.FullName)" } else { Write-Host "  ⚠️ Telegram 未找到" }
+
+          Write-Host "✅ 下载工具安装完成 | 下载目录: D:\Downloads"
+
+      - name: 5. Desktop Shortcuts & Cleanup
+        run: |
+          $desktop = "C:\Users\Public\Desktop"
+          $shell = New-Object -ComObject WScript.Shell
+
+          $apps = @(
+            @{ Name = "IDM.lnk";          Pattern = "IDMan.exe";       Paths = @("C:\Program Files*\Internet Download Manager") },
+            @{ Name = "qBittorrent.lnk";  Pattern = "qbittorrent.exe"; Paths = @("C:\Program Files*\qBittorrent") },
+            @{ Name = "Telegram.lnk";     Pattern = "Telegram.exe";    Paths = @("C:\Users\*\AppData\Local\Telegram Desktop","C:\Program Files*\Telegram Desktop") }
+          )
+
+          foreach ($app in $apps) {
+            foreach ($p in $app.Paths) {
+              $exe = Get-ChildItem $p -Filter $app.Pattern -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($exe) {
+                $lnk = $shell.CreateShortcut("$desktop\$($app.Name)")
+                $lnk.TargetPath = $exe.FullName
+                $lnk.Save()
+                Write-Host "  ✅ $($app.Name)"
+                break
+              }
+            }
+          }
+
+          # 清理临时文件
+          Remove-Item "C:\idm.exe","C:\qb.exe","C:\tg.exe","C:\tailscale.msi" -Force -ErrorAction SilentlyContinue
+          Write-Host "✅ 快捷方式创建完成，临时文件已清理"
+
+      - name: 6. Keep Server Alive (5.5 Hours)
         run: |
           $totalMinutes = 330
           $endTime = (Get-Date).AddMinutes($totalMinutes)
