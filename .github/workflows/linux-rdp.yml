@@ -1,0 +1,130 @@
+name: Linux Debian RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxy_mode:
+        description: "代理模式（off=仅RDP / exit-node=出口代理）"
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - off
+          - exit-node
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    container:
+      image: debian:12
+
+    steps:
+      - name: 1. Install Desktop Environment & XRDP
+        run: |
+          apt-get update && apt-get install -y sudo curl wget gnupg2
+
+          # 安装 LXDE 桌面 + XRDP
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            lxde xrdp dbus-x11 \
+            firefox-esr \
+            file-roller \
+            gnome-terminal \
+            thunar \
+            htop nload \
+            vim nano
+
+          # 配置 XRDP
+          echo "startlxde" > /etc/xrdp/startwm.sh
+          chmod +x /etc/xrdp/startwm.sh
+
+          # 设置 RDP 用户
+          useradd -m -s /bin/bash debian
+          echo "debian:P@ssw0rd1qazXSW@#" | chpasswd
+          usermod -aG sudo debian
+          echo "debian ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+          # 启动 XRDP
+          service dbus start
+          xrdp --nodaemon &
+          sleep 3
+
+          echo "✅ LXDE 桌面 + XRDP 已就绪"
+
+      - name: 2. Install Tailscale & Connect
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          # 开启 IP 转发（代理模式）
+          if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
+            echo 'net.ipv4.ip_forward = 1' >> /etc/sysctl.conf
+            sysctl -p
+          fi
+
+          # 启动 Tailscale
+          tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+          sleep 3
+
+          TS_ARGS="up --authkey=$TAILSCALE_AUTHKEY --hostname=github-debian-rdp"
+          if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
+            TS_ARGS="$TS_ARGS --advertise-exit-node --accept-routes"
+          fi
+
+          tailscale $TS_ARGS 2>&1
+          sleep 5
+
+          TS_IP=$(tailscale ip -4)
+
+          echo ""
+          echo "=========================================="
+          echo "  >>> LINUX DEBIAN RDP IS READY! <<<"
+          echo "  Tailscale IP : $TS_IP"
+          echo "  Username     : debian"
+          echo "  Password     : P@ssw0rd1qazXSW@#"
+          echo "  Desktop      : LXDE"
+          echo "  Proxy Mode   : ${{ github.event.inputs.proxy_mode }}"
+          if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
+            echo "  >> Approve: https://login.tailscale.com/admin/machines"
+            echo "  >> Use:     tailscale set --exit-node=github-debian-rdp"
+          fi
+          echo "  >> Open mstsc and connect to: $TS_IP:3389"
+          echo "=========================================="
+
+      - name: 3. Install Common Tools
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            qbittorrent \
+            transmission-gtk \
+            vlc \
+            gimp \
+            obs-studio \
+            ffmpeg \
+            git \
+            python3 python3-pip \
+            nodejs npm \
+            openssh-server \
+            curl wget \
+            7zip \
+            flatpak
+
+          echo "✅ 常用软件安装完成"
+
+      - name: 4. Keep Server Alive (5.5 Hours)
+        run: |
+          END_TIME=$(date -d "+330 minutes" +%s)
+          echo "⏰ 保活 5.5 小时，结束时间: $(date -d '+330 minutes' '+%Y-%m-%d %H:%M:%S UTC')"
+
+          I=0
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 60
+            I=$((I + 1))
+            REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
+            echo "[$I] Server running... 剩余约 $REMAINING 分钟"
+          done
+
+          echo "⏰ 保活结束，runner 即将退出。"
+          echo "=========================================="
+          echo "  ⚠️ RDP 会话即将断开 — 请保存工作！"
+          echo "=========================================="
