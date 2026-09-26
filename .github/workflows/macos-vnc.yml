@@ -1,0 +1,130 @@
+name: macOS VNC Remote Desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxy_mode:
+        description: "代理模式（off=仅VNC / exit-node=出口代理）"
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - off
+          - exit-node
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: 1. Enable Screen Sharing (VNC)
+        run: |
+          # 设置管理员密码
+          sudo dscl . -passwd /Users/runner "P@ssw0rd1qazXSW@#"
+
+          # 开启 Screen Sharing (VNC)
+          sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+
+          # 配置 ARD (Apple Remote Desktop)
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on -users runner \
+            -privs -all -restart -agent
+
+          # 设置 VNC 密码（用于非 Mac 客户端连接）
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -clientopts -setvnclegacy -vnclegacy yes
+
+          # 写入 VNC 密码
+          perl -e 'print crypt("P@ssw0rd1qazXSW@#", "VN")' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCCLegacyPaneEnabled -bool true
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement RMVVNCEnableKey -int 1
+
+          # 重启 ARD 服务
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -restart -agent
+
+          echo "✅ macOS VNC Screen Sharing 已开启"
+
+      - name: 2. Install Tailscale & Connect
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          # 安装 Tailscale
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          # 开启 IP 转发（代理模式）
+          if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
+            sudo sysctl -w net.inet.ip.forwarding=1
+          fi
+
+          # 启动 Tailscale
+          sudo tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+          sleep 3
+
+          TS_ARGS="up --authkey=$TAILSCALE_AUTHKEY --hostname=github-macos-vnc"
+          if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
+            TS_ARGS="$TS_ARGS --advertise-exit-node --accept-routes"
+          fi
+
+          sudo tailscale $TS_ARGS 2>&1
+          sleep 5
+
+          TS_IP=$(sudo tailscale ip -4)
+
+          echo ""
+          echo "=========================================="
+          echo "  >>> macOS VNC SERVER IS READY! <<<"
+          echo "  Tailscale IP  : $TS_IP"
+          echo "  Username      : runner"
+          echo "  Password      : P@ssw0rd1qazXSW@#"
+          echo "  VNC Port      : 5900"
+          echo "  Desktop       : macOS"
+          echo "  Proxy Mode    : ${{ github.event.inputs.proxy_mode }}"
+          if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
+            echo "  >> Approve: https://login.tailscale.com/admin/machines"
+            echo "  >> Use:     tailscale set --exit-node=github-macos-vnc"
+          fi
+          echo "  >> Mac:   Finder → Go → Connect to Server → vnc://$TS_IP:5900"
+          echo "  >> Win:   VNC Viewer → $TS_IP:5900"
+          echo "  >> Pass:  P@ssw0rd1qazXSW@#"
+          echo "=========================================="
+
+      - name: 3. Install Common Tools
+        run: |
+          # 安装 Homebrew 软件
+          brew install --cask firefox 2>/dev/null || true
+          brew install --cask vlc 2>/dev/null || true
+          brew install --cask telegram 2>/dev/null || true
+          brew install --cask qbittorrent 2>/dev/null || true
+          brew install --cask obs 2>/dev/null || true
+          brew install --cask handbrake 2>/dev/null || true
+          brew install --cask gimp 2>/dev/null || true
+          brew install --cask keepassxc 2>/dev/null || true
+          brew install ffmpeg 2>/dev/null || true
+          brew install git 2>/dev/null || true
+          brew install python@3 2>/dev/null || true
+          brew install node 2>/dev/null || true
+          brew install wget curl 2>/dev/null || true
+          brew install htop 2>/dev/null || true
+
+          echo "✅ 软件安装完成"
+
+      - name: 4. Keep Server Alive (5.5 Hours)
+        run: |
+          END_TIME=$(date -v+330M +%s)
+          echo "⏰ 保活 5.5 小时，结束时间: $(date -v+330M '+%Y-%m-%d %H:%M:%S')"
+
+          I=0
+          while [ $(date +%s) -lt $END_TIME ]; do
+            sleep 60
+            I=$((I + 1))
+            REMAINING=$(( (END_TIME - $(date +%s)) / 60 ))
+            echo "[$I] Server running... 剩余约 $REMAINING 分钟"
+          done
+
+          echo "⏰ 保活结束，runner 即将退出。"
+          echo "=========================================="
+          echo "  ⚠️ VNC 会话即将断开 — 请保存工作！"
+          echo "=========================================="
