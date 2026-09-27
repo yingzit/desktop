@@ -18,32 +18,34 @@ jobs:
     timeout-minutes: 330
 
     steps:
-      - name: 1. Create Admin User & Enable VNC
+      - name: 1. Enable Screen Sharing (VNC)
         run: |
-          # 创建新管理员用户（避免修改 runner 密码）
-          sudo sysadminctl -addUser macadmin -password "P@ssw0rd1qazXSW@#" -admin
-          sudo dscl . -append /Groups/admin GroupMembership macadmin
+          # 设置 runner 用户密码（macOS 用 dscl）
+          sudo dscl . -passwd /Users/runner P@ssw0rd1qazXSW@#
 
           # 开启 Screen Sharing (VNC)
           sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
 
-          # 配置 ARD 给 macadmin 用户
+          # 配置 ARD (Apple Remote Desktop)
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -users macadmin \
+            -activate -configure -access -on -users runner \
             -privs -all -restart -agent
 
-          # 设置 VNC 密码（用于非 Mac 客户端）
+          # 设置 VNC 密码（用于非 Mac 客户端连接）
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -configure -clientopts -setvnclegacy -vnclegacy yes
 
+          # 写入 VNC 密码
           echo -n "P@ssw0rd1qazXSW@#" | perl -ne 'chomp; print crypt($_, "VN")' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
           sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCCLegacyPaneEnabled -bool true
           sudo defaults write /Library/Preferences/com.apple.RemoteManagement RMVVNCEnableKey -int 1
 
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -restart -agent
+          # 重启 ARD 服务
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -restart -agent
 
-          echo "✅ macOS VNC 已开启 | 用户: macadmin"
+          echo "✅ macOS VNC Screen Sharing 已开启"
 
       - name: 2. Install Tailscale & Connect
         env:
@@ -75,7 +77,7 @@ jobs:
           echo "=========================================="
           echo "  >>> macOS VNC SERVER IS READY! <<<"
           echo "  Tailscale IP  : $TS_IP"
-          echo "  Username      : macadmin"
+          echo "  Username      : runner"
           echo "  Password      : P@ssw0rd1qazXSW@#"
           echo "  VNC Port      : 5900"
           echo "  Desktop       : macOS"
