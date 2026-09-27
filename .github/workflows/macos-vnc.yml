@@ -20,8 +20,8 @@ jobs:
     steps:
       - name: 1. Enable Screen Sharing (VNC)
         run: |
-          # 设置管理员密码
-          sudo dscl . -passwd /Users/runner "P@ssw0rd1qazXSW@#"
+          # 设置 runner 用户密码
+          echo "runner:P@ssw0rd1qazXSW@#" | sudo chpasswd
 
           # 开启 Screen Sharing (VNC)
           sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
@@ -37,7 +37,7 @@ jobs:
             -configure -clientopts -setvnclegacy -vnclegacy yes
 
           # 写入 VNC 密码
-          perl -e 'print crypt("P@ssw0rd1qazXSW@#", "VN")' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
+          echo -n "P@ssw0rd1qazXSW@#" | perl -ne 'chomp; print crypt($_, "VN")' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
           sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCCLegacyPaneEnabled -bool true
           sudo defaults write /Library/Preferences/com.apple.RemoteManagement RMVVNCEnableKey -int 1
 
