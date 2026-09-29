@@ -20,8 +20,9 @@ jobs:
     steps:
       - name: 1. Enable Screen Sharing (VNC)
         run: |
-          # 设置 runner 用户密码（macOS 用 dscl）
-          sudo dscl . -u runner -passwd /Users/runner P@ssw0rd1qazXSW@#
+          # 设置 runner 用户密码（macOS 用 dscl，密码加引号防止 # 被注释）
+          sudo dscl . -passwd /Users/runner 'P@ssw0rd1qazXSW@#' || \
+          sudo sysadminctl -resetPasswordFor runner -newPassword 'P@ssw0rd1qazXSW@#' || true
 
           # 开启 Screen Sharing (VNC)
           sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
