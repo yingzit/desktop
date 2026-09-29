@@ -52,27 +52,33 @@ jobs:
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # 安装 Tailscale
-          curl -fsSL https://tailscale.com/install.sh | sh
+          # 用 Homebrew 安装 Tailscale CLI 版（不用 App Store 版）
+          brew install tailscale
+
+          # 创建目录
+          sudo mkdir -p /var/lib/tailscale /var/run/tailscale
 
           # 开启 IP 转发（代理模式）
           if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
             sudo sysctl -w net.inet.ip.forwarding=1
           fi
 
-          # 启动 Tailscale
-          sudo tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
-          sleep 3
-
-          TS_ARGS="up --authkey=$TAILSCALE_AUTHKEY --hostname=github-macos-vnc"
-          if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
-            TS_ARGS="$TS_ARGS --advertise-exit-node --accept-routes"
-          fi
-
-          sudo tailscale $TS_ARGS 2>&1
+          # 启动 tailscaled 守护进程
+          sudo $(which tailscaled) --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
           sleep 5
 
-          TS_IP=$(sudo tailscale ip -4)
+          # 连接 Tailscale
+          PROXY_MODE="${{ github.event.inputs.proxy_mode }}"
+          TS_BIN=$(which tailscale)
+
+          if [ "$PROXY_MODE" = "exit-node" ]; then
+            sudo "$TS_BIN" up --authkey="$TAILSCALE_AUTHKEY" --hostname=github-macos-vnc --advertise-exit-node --accept-routes 2>&1
+          else
+            sudo "$TS_BIN" up --authkey="$TAILSCALE_AUTHKEY" --hostname=github-macos-vnc 2>&1
+          fi
+
+          sleep 5
+          TS_IP=$(sudo "$TS_BIN" ip -4)
 
           echo ""
           echo "=========================================="
@@ -82,8 +88,8 @@ jobs:
           echo "  Password      : P@ssw0rd1qazXSW@#"
           echo "  VNC Port      : 5900"
           echo "  Desktop       : macOS"
-          echo "  Proxy Mode    : ${{ github.event.inputs.proxy_mode }}"
-          if [ "${{ github.event.inputs.proxy_mode }}" = "exit-node" ]; then
+          echo "  Proxy Mode    : $PROXY_MODE"
+          if [ "$PROXY_MODE" = "exit-node" ]; then
             echo "  >> Approve: https://login.tailscale.com/admin/machines"
             echo "  >> Use:     tailscale set --exit-node=github-macos-vnc"
           fi
