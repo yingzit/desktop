@@ -63,8 +63,8 @@ jobs:
             sudo sysctl -w net.inet.ip.forwarding=1
           fi
 
-          # 启动 tailscaled 守护进程
-          sudo $(which tailscaled) --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+          # 启动 tailscaled 守护进程（用默认 socket 路径）
+          sudo $(which tailscaled) --state=/var/lib/tailscale/tailscaled.state &
           sleep 5
 
           # 连接 Tailscale
