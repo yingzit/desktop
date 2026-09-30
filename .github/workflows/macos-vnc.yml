@@ -24,6 +24,11 @@ jobs:
           sudo dscl . -passwd /Users/runner 'P@ssw0rd1qazXSW@#' || \
           sudo sysadminctl -resetPasswordFor runner -newPassword 'P@ssw0rd1qazXSW@#' || true
 
+          # 授予屏幕录制和屏幕控制权限（TCC 数据库）
+          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "INSERT OR REPLACE INTO service (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) VALUES ('kTCCServiceScreenCapture', 'com.apple.screensharing.agent', 0, 2, 0, 1, 0, strftime('%s','now'));" 2>/dev/null || true
+          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "INSERT OR REPLACE INTO service (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) VALUES ('kTCCServiceScreenCapture', 'com.apple.RemoteDesktop', 0, 2, 0, 1, 0, strftime('%s','now'));" 2>/dev/null || true
+          sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "INSERT OR REPLACE INTO service (service, client, client_type, auth_value, auth_reason, auth_version, flags, last_modified) VALUES ('kTCCServiceAccessibility', 'com.apple.screensharing.agent', 0, 2, 0, 1, 0, strftime('%s','now'));" 2>/dev/null || true
+
           # 开启 Screen Sharing (VNC)
           sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
@@ -46,7 +51,7 @@ jobs:
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -restart -agent
 
-          echo "✅ macOS VNC Screen Sharing 已开启"
+          echo "✅ macOS VNC Screen Sharing 已开启（含屏幕录制权限）"
 
       - name: 2. Install Tailscale & Connect
         env:
