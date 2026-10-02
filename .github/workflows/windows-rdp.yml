@@ -75,45 +75,17 @@ jobs:
           Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==========================================" -ForegroundColor Green
 
-      - name: 4. Set Chinese Language & Beijing Timezone
-        run: |
-          # 设置时区为北京时间（UTC+8）
-          Set-TimeZone -Id "China Standard Time"
-          Write-Host "✅ 时区: 北京时间 (UTC+8)"
-
-          # 设置区域文化为中文
-          Set-Culture zh-CN
-          Write-Host "✅ 区域: zh-CN"
-
-          # 设置用户语言列表
-          $langList = New-WinUserLanguageList zh-CN
-          Set-WinUserLanguageList $langList -Force -ErrorAction SilentlyContinue
-          Write-Host "✅ 语言列表: zh-CN"
-
-          # 设置 UI 语言
-          Set-WinUILanguageOverride zh-CN -ErrorAction SilentlyContinue
-          Write-Host "✅ UI 语言: zh-CN"
-
-          # 设置日期时间格式
-          Set-ItemProperty -Path "HKCU:\Control Panel\International" -Name "sShortDate" -Value "yyyy/M/d"
-          Set-ItemProperty -Path "HKCU:\Control Panel\International" -Name "sLongDate" -Value "yyyy'年'M'月'd'日'"
-          Set-ItemProperty -Path "HKCU:\Control Panel\International" -Name "sShortTime" -Value "H:mm"
-          Set-ItemProperty -Path "HKCU:\Control Panel\International" -Name "sTimeFormat" -Value "H:mm:ss"
-          Write-Host "✅ 日期时间格式: 中文"
-
-          Write-Host "✅ 中文语言 + 北京时间设置完成"
-
-      - name: 5. Cleanup
+      - name: 4. Cleanup
         run: |
           Remove-Item "C:\tailscale.msi" -Force -ErrorAction SilentlyContinue
           Write-Host "✅ 临时文件已清理"
 
-      - name: 6. Keep Server Alive (5.5 Hours)
+      - name: 5. Keep Server Alive (5.5 Hours)
         run: |
           $totalMinutes = 330
           $endTime = (Get-Date).AddMinutes($totalMinutes)
 
-          Write-Host "⏰ 保活 5.5 小时，结束时间: $endTime (北京时间)"
+          Write-Host "⏰ 保活 5.5 小时，结束时间: $endTime (UTC)"
 
           $i = 0
           while ((Get-Date) -lt $endTime) {
