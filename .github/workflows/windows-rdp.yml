@@ -101,9 +101,6 @@ jobs:
           Set-ItemProperty -Path "HKCU:\Control Panel\International" -Name "sTimeFormat" -Value "H:mm:ss"
           Write-Host "✅ 日期时间格式: 中文"
 
-          # 安装中文语言包（可选，失败不影响）
-          try { Install-Language zh-CN } catch { Write-Host "⚠️ 语言包安装跳过" }
-
           Write-Host "✅ 中文语言 + 北京时间设置完成"
 
       - name: 5. Cleanup
